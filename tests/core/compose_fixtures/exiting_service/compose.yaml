@@ -1,0 +1,8 @@
+services:
+  exiting:
+    image: alpine:latest
+    init: true
+    command:
+      - sh
+      - -c
+      - 'echo about to exit; sleep 1; exit 5'

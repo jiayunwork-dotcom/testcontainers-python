@@ -16,6 +16,7 @@ import re
 import time
 import warnings
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable, Optional, Protocol, TypeVar, Union, cast
 
@@ -23,6 +24,7 @@ import wrapt
 from typing_extensions import Self
 
 from testcontainers.core.config import testcontainers_config
+from testcontainers.core.exceptions import ContainerExitedException
 from testcontainers.core.utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -133,6 +135,88 @@ class WaitStrategy(ABC):
 
             seconds_left_until_next = self._poll_interval - (time.time() - start_attempt)
             time.sleep(max(0.0, seconds_left_until_next))
+
+
+# Docker container statuses which prove that the container process has terminated.
+# "exited" covers normal and error exits (including exit code 0 and OOM kills);
+# "dead" is a terminal state the daemon cannot recover from.
+EXITED_CONTAINER_STATUSES = frozenset({"exited", "dead"})
+
+
+@dataclass(frozen=True)
+class ContainerExitState:
+    """Terminal state of a container that has exited while a wait strategy was polling."""
+
+    status: str
+    exit_code: Optional[int]
+    oom_killed: bool
+
+
+def get_container_exit_state(container: WaitStrategyTarget) -> Optional[ContainerExitState]:
+    """
+    Reload the container and return its terminal state if it has definitively exited.
+
+    Returns ``None`` while the container is ``running`` or in any other non-terminal
+    state (``created``, ``paused``, ``restarting``, ...), and also when the container
+    state cannot be read: none of those situations prove that the container exited.
+
+    The state is read from freshly reloaded container data. The cached
+    ``get_container_info`` lookup is deliberately not used, so its caching behaviour
+    remains unchanged.
+    """
+    try:
+        wrapped = container.get_wrapped_container()
+        container.reload()
+        status, exit_code, oom_killed = _read_container_exit_state(wrapped)
+    except Exception:
+        logger.debug("could not read container state while waiting for readiness", exc_info=True)
+        return None
+
+    if not isinstance(status, str) or status not in EXITED_CONTAINER_STATUSES:
+        return None
+
+    return ContainerExitState(
+        status=status,
+        exit_code=exit_code if isinstance(exit_code, int) else None,
+        oom_killed=oom_killed is True,
+    )
+
+
+def _read_container_exit_state(wrapped: Any) -> tuple[Any, Any, Any]:
+    attrs = getattr(wrapped, "attrs", None)
+    if isinstance(attrs, dict):
+        # docker-py ``Container`` object: ``reload()`` refreshed ``attrs``.
+        state = attrs.get("State") or {}
+        return state.get("Status"), state.get("ExitCode"), state.get("OOMKilled")
+    # ``ComposeContainer`` snapshot: its ``reload()`` re-queries ``docker compose ps``
+    # and refreshes these attributes on the wrapped object itself.
+    return (
+        getattr(wrapped, "State", None),
+        getattr(wrapped, "ExitCode", None),
+        getattr(wrapped, "OOMKilled", None),
+    )
+
+
+def raise_if_container_exited(container: WaitStrategyTarget) -> None:
+    """
+    Raise :class:`ContainerExitedException` on the next poll if the container exited.
+
+    The error message always contains the container exit code (exit code 0 is a
+    failure too) and additionally mentions ``OOM`` when the container was killed
+    because it ran out of memory.
+    """
+    exit_state = get_container_exit_state(container)
+    if exit_state is not None:
+        raise ContainerExitedException(_container_exited_message(exit_state))
+
+
+def _container_exited_message(exit_state: ContainerExitState) -> str:
+    exit_code_text = "unknown" if exit_state.exit_code is None else str(exit_state.exit_code)
+    oom_text = " (OOM killed)" if exit_state.oom_killed else ""
+    return (
+        f"Container exited with exit code {exit_code_text}{oom_text} before the wait strategy "
+        f"reported it ready (container status: {exit_state.status})."
+    )
 
 
 # Keep existing wait_container_is_ready but make it use the new system internally
@@ -405,8 +489,11 @@ def _get_container_status_info(container: WaitStrategyTarget) -> dict[str, str]:
 
 
 __all__ = [
+    "ContainerExitState",
     "WaitStrategy",
     "WaitStrategyTarget",
+    "get_container_exit_state",
+    "raise_if_container_exited",
     "wait_container_is_ready",
     "wait_for",
     "wait_for_logs",

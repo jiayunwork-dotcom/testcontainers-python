@@ -16,6 +16,10 @@ class ContainerStartException(RuntimeError):
     pass
 
 
+class ContainerExitedException(RuntimeError):
+    """Raised when a container exits (including with exit code 0) before its wait strategy succeeds."""
+
+
 class ContainerConnectException(RuntimeError):
     pass
 

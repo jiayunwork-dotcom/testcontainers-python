@@ -45,7 +45,11 @@ from testcontainers.compose import DockerCompose
 from testcontainers.core.utils import setup_logger
 
 # Import base classes from waiting_utils to make them available for tests
-from testcontainers.core.waiting_utils import WaitStrategy, WaitStrategyTarget
+from testcontainers.core.waiting_utils import (
+    WaitStrategy,
+    WaitStrategyTarget,
+    raise_if_container_exited,
+)
 
 if TYPE_CHECKING:
     from testcontainers.core.container import DockerContainer
@@ -386,6 +390,9 @@ class HttpWaitStrategy(WaitStrategy):
         url = self._build_url(container)
 
         while True:
+            # Fail on the next poll if the container exited (crash, OOM kill, exit 0, ...).
+            raise_if_container_exited(container)
+
             if time.time() - start_time > self._startup_timeout:
                 self._raise_timeout_error(url)
 
@@ -563,6 +570,9 @@ class PortWaitStrategy(WaitStrategy):
         port = int(container.get_exposed_port(self._port))
 
         while True:
+            # Fail on the next poll if the container exited (crash, OOM kill, exit 0, ...).
+            raise_if_container_exited(container)
+
             if time.time() - start_time > self._startup_timeout:
                 raise TimeoutError(
                     f"Port {self._port} not available within {self._startup_timeout} seconds. "
@@ -622,6 +632,9 @@ class FileExistsWaitStrategy(WaitStrategy):
         )
 
         while True:
+            # Fail on the next poll if the container exited (crash, OOM kill, exit 0, ...).
+            raise_if_container_exited(container)
+
             if time.time() - start_time > self._startup_timeout:
                 # Check what files actually exist in the directory
                 parent_dir = self._file_path.parent
@@ -666,15 +679,32 @@ class ContainerStatusWaitStrategy(WaitStrategy):
     https://docs.docker.com/reference/cli/docker/container/ls/#status
     """
 
-    CONTINUE_STATUSES = frozenset(("created", "restarting"))
+    CONTINUE_STATUSES = frozenset(("created", "paused", "restarting", "removing"))
 
     def __init__(self) -> None:
         super().__init__()
 
     def wait_until_ready(self, container: WaitStrategyTarget) -> None:
-        result = self._poll(lambda: self.running(self.get_status(container)))
-        if not result:
-            raise TimeoutError("container did not become running")
+        start = time.time()
+        while True:
+            # A crashed, OOM-killed or exit-0 container fails straight away with its
+            # exit code; created/paused/restarting (and unreadable) states keep polling.
+            raise_if_container_exited(container)
+
+            if time.time() - start > self._startup_timeout:
+                raise TimeoutError("container did not become running")
+
+            try:
+                if self.running(self.get_status(container)):
+                    return
+            except StopIteration:
+                # The status is neither "running" nor a proven exit; keep waiting.
+                logger.debug("container status not valid for continuing; continuing to wait")
+            except Exception:
+                # Unreadable container status must not be mistaken for an exit.
+                logger.debug("could not read container status; continuing to wait", exc_info=True)
+
+            time.sleep(self._poll_interval)
 
     @staticmethod
     def running(status: str) -> bool:
@@ -846,6 +876,9 @@ class ExecWaitStrategy(WaitStrategy):
         last_output = None
 
         while True:
+            # Fail on the next poll if the container exited (crash, OOM kill, exit 0, ...).
+            raise_if_container_exited(container)
+
             duration = time.time() - start_time
             if duration > self._startup_timeout:
                 command_str = " ".join(self._command)

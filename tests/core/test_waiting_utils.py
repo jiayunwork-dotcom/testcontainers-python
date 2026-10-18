@@ -1,6 +1,7 @@
 import pytest
 
 from testcontainers.core.container import DockerContainer
+from testcontainers.core.exceptions import ContainerExitedException
 from testcontainers.core.wait_strategies import ContainerStatusWaitStrategy
 from testcontainers.core.waiting_utils import wait_container_is_ready, wait_for_logs
 
@@ -35,7 +36,7 @@ def test_wait_container_is_ready_decorator_with_container() -> None:
         # we are happy with an exited (even crashed) container that has logs.
         try:
             ContainerStatusWaitStrategy().wait_until_ready(container)
-        except TimeoutError:
+        except (TimeoutError, ContainerExitedException):
             pass
 
         stdout, stderr = container.get_logs()

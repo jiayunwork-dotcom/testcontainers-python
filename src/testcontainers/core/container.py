@@ -21,7 +21,7 @@ from typing_extensions import Self, assert_never
 from testcontainers.core.config import ConnectionMode
 from testcontainers.core.config import testcontainers_config as c
 from testcontainers.core.docker_client import DockerClient
-from testcontainers.core.exceptions import ContainerConnectException, ContainerStartException
+from testcontainers.core.exceptions import ContainerConnectException, ContainerExitedException, ContainerStartException
 from testcontainers.core.inspect import ContainerInspectInfo
 from testcontainers.core.labels import LABEL_SESSION_ID, SESSION_ID
 from testcontainers.core.network import Network
@@ -280,7 +280,7 @@ class DockerContainer:
         if self._wait_strategy is not None:
             try:
                 self._wait_strategy.wait_until_ready(self)
-            except TimeoutError as ex:
+            except (TimeoutError, ContainerExitedException) as ex:
                 if hasattr(ex, "add_note"):
                     ex.add_note(self._container.logs().decode())
                 raise ex

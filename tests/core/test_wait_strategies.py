@@ -5,13 +5,20 @@ import re
 import time
 from datetime import timedelta
 from email.message import Message
+from types import SimpleNamespace
+from typing import Any, Optional, cast
 from unittest.mock import Mock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
+from testcontainers.compose import ComposeContainer
+from testcontainers.core.exceptions import ContainerExitedException
+from testcontainers.core.inspect import ContainerInspectInfo, ContainerState
 from testcontainers.core.wait_strategies import (
     CompositeWaitStrategy,
+    ContainerStatusWaitStrategy,
+    ExecWaitStrategy,
     FileExistsWaitStrategy,
     HealthcheckWaitStrategy,
     HttpWaitStrategy,
@@ -20,6 +27,7 @@ from testcontainers.core.wait_strategies import (
     WaitStrategy,
     WaitStrategyTarget,
 )
+from testcontainers.core.waiting_utils import get_container_exit_state, raise_if_container_exited
 
 
 class ConcreteWaitStrategy(WaitStrategy):
@@ -716,3 +724,437 @@ class TestCompositeWaitStrategy:
         composite = CompositeWaitStrategy(*strategies)
         assert len(composite._strategies) == expected_count
         assert composite._strategies == strategies
+
+
+def _container_state(
+    status: Optional[str] = "running", exit_code: Optional[int] = None, oom_killed: bool = False
+) -> dict[str, Any]:
+    return {"Status": status, "ExitCode": exit_code, "OOMKilled": oom_killed}
+
+
+class FakeWrappedContainer:
+    """Minimal docker-py ``Container`` stand-in driven by a sequence of states."""
+
+    def __init__(self, state_sequence: list[dict[str, Any]]) -> None:
+        self._states = list(state_sequence)
+        self._index = 0
+        self.attrs: dict[str, Any] = {"State": self._states[0]}
+
+    def reload(self) -> None:
+        self._index = min(self._index + 1, len(self._states) - 1)
+        self.attrs = {"State": self._states[self._index]}
+
+
+class FakeWaitTarget:
+    """Minimal :class:`WaitStrategyTarget` backed by a :class:`FakeWrappedContainer`."""
+
+    def __init__(self, wrapped: FakeWrappedContainer, exec_result: Any = None) -> None:
+        self._wrapped = wrapped
+        self._exec_result = exec_result
+        self.exec_calls = 0
+
+    def get_wrapped_container(self) -> FakeWrappedContainer:
+        return self._wrapped
+
+    def reload(self) -> None:
+        self._wrapped.reload()
+
+    def get_container_host_ip(self) -> str:
+        return "127.0.0.1"
+
+    def get_exposed_port(self, port: int) -> int:
+        return 9000
+
+    def get_logs(self) -> tuple[bytes, bytes]:
+        return b"", b""
+
+    def exec(self, command: Any) -> Any:
+        self.exec_calls += 1
+        return self._exec_result
+
+    @property
+    def status(self) -> str:
+        status = self._wrapped.attrs["State"]["Status"]
+        return str(status)
+
+
+class FakeComposeSnapshot:
+    """Minimal ``ComposeContainer``-like snapshot (plain attributes, refreshed by reload)."""
+
+    def __init__(self, state_sequence: list[dict[str, Any]]) -> None:
+        self._states = list(state_sequence)
+        self._index = 0
+        state = self._states[0]
+        self.State: Optional[str] = state["Status"]
+        self.ExitCode: Optional[int] = state["ExitCode"]
+        self.OOMKilled: Optional[bool] = state["OOMKilled"]
+
+    def reload(self) -> None:
+        self._index = min(self._index + 1, len(self._states) - 1)
+        state = self._states[self._index]
+        self.State = state["Status"]
+        self.ExitCode = state["ExitCode"]
+        self.OOMKilled = state["OOMKilled"]
+
+
+class FakeComposeTarget:
+    def __init__(self, snapshot: FakeComposeSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def get_wrapped_container(self) -> FakeComposeSnapshot:
+        return self._snapshot
+
+    def reload(self) -> None:
+        self._snapshot.reload()
+
+    def get_container_host_ip(self) -> str:
+        return "127.0.0.1"
+
+    def get_exposed_port(self, port: int) -> int:
+        return 9000
+
+    def get_logs(self) -> tuple[bytes, bytes]:
+        return b"", b""
+
+    @property
+    def status(self) -> str:
+        return str(self._snapshot.State)
+
+
+class TestContainerExitDetection:
+    """Shared exit-state detection used by the HTTP/port/exec/file strategies."""
+
+    @pytest.mark.parametrize(
+        "state,expected_code,expected_oom",
+        [
+            (_container_state("exited", 1), 1, False),
+            (_container_state("exited", 0), 0, False),
+            (_container_state("exited", 137, True), 137, True),
+            (_container_state("dead", 139), 139, False),
+        ],
+        ids=["exited_code_1", "exited_code_0", "exited_oom_137", "dead_code_139"],
+    )
+    def test_detects_terminal_states_with_exit_code(self, state, expected_code, expected_oom):
+        target = FakeWaitTarget(FakeWrappedContainer([state]))
+        exit_state = get_container_exit_state(target)
+        assert exit_state is not None
+        assert exit_state.status == state["Status"]
+        assert exit_state.exit_code == expected_code
+        assert exit_state.oom_killed is expected_oom
+
+    @pytest.mark.parametrize(
+        "status",
+        ["running", "created", "paused", "restarting", "removing", "unknown", None],
+        ids=["running", "created", "paused", "restarting", "removing", "unknown", "missing"],
+    )
+    def test_non_terminal_and_unknown_states_are_not_exits(self, status):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state(status)]))
+        assert get_container_exit_state(target) is None
+
+    def test_unreadable_state_is_not_an_exit(self):
+        target = Mock()
+        target.get_wrapped_container.side_effect = RuntimeError("docker daemon unavailable")
+        assert get_container_exit_state(target) is None
+
+    def test_reload_failure_is_not_an_exit(self, monkeypatch: pytest.MonkeyPatch):
+        wrapped = FakeWrappedContainer([_container_state("exited", 1)])
+        target = FakeWaitTarget(wrapped)
+        monkeypatch.setattr(target, "reload", Mock(side_effect=RuntimeError("docker daemon unavailable")))
+        assert get_container_exit_state(target) is None
+
+    def test_compose_snapshot_is_supported(self):
+        snapshot = FakeComposeSnapshot(
+            [
+                _container_state("running"),
+                _container_state("running"),
+                _container_state("exited", 137, True),
+            ]
+        )
+        target = FakeComposeTarget(snapshot)
+        assert get_container_exit_state(target) is None
+        exit_state = get_container_exit_state(target)
+        assert exit_state is not None
+        assert exit_state.exit_code == 137
+        assert exit_state.oom_killed is True
+
+    def test_raise_message_contains_exit_code(self):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("exited", 1)]))
+        with pytest.raises(ContainerExitedException, match=r"exit code 1"):
+            raise_if_container_exited(target)
+
+    def test_raise_message_contains_exit_code_zero(self):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("exited", 0)]))
+        with pytest.raises(ContainerExitedException, match=r"exit code 0"):
+            raise_if_container_exited(target)
+
+    def test_raise_message_mentions_oom(self):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("exited", 137, True)]))
+        with pytest.raises(ContainerExitedException, match=r"exit code 137 \(OOM killed\)"):
+            raise_if_container_exited(target)
+
+    def test_unknown_exit_code_is_reported_as_unknown(self):
+        target = FakeWaitTarget(FakeWrappedContainer([{"Status": "exited", "OOMKilled": False}]))
+        with pytest.raises(ContainerExitedException, match=r"exit code unknown"):
+            raise_if_container_exited(target)
+
+
+class TestWaitStrategiesFailFastOnExit:
+    """HTTP/port/exec/file strategies fail on the next poll when the container exits."""
+
+    @pytest.mark.parametrize(
+        "exit_code,oom",
+        [(1, False), (0, False), (137, True)],
+        ids=["crash_code_1", "clean_code_0", "oom_code_137"],
+    )
+    @patch("testcontainers.core.wait_strategies.urlopen")
+    def test_http_strategy_fails_on_next_poll_when_container_exits(self, mock_urlopen, exit_code, oom):
+        mock_urlopen.side_effect = URLError(ConnectionRefusedError())
+        target = FakeWaitTarget(
+            FakeWrappedContainer(
+                [_container_state("running"), _container_state("running"), _container_state("exited", exit_code, oom)]
+            )
+        )
+        strategy = HttpWaitStrategy(8080).with_startup_timeout(30).with_poll_interval(0.01)
+
+        start = time.monotonic()
+        with pytest.raises(ContainerExitedException, match=rf"exit code {exit_code}"):
+            strategy.wait_until_ready(target)
+        assert time.monotonic() - start < 5
+        # Exactly one readiness probe ran before the exit was observed on the next poll.
+        assert mock_urlopen.call_count == 1
+
+    @patch("testcontainers.core.wait_strategies.urlopen")
+    def test_http_strategy_fails_immediately_when_container_already_exited(self, mock_urlopen):
+        mock_urlopen.side_effect = URLError(ConnectionRefusedError())
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("exited", 2)]))
+        strategy = HttpWaitStrategy(8080).with_startup_timeout(30).with_poll_interval(0.01)
+
+        with pytest.raises(ContainerExitedException, match=r"exit code 2"):
+            strategy.wait_until_ready(target)
+        assert mock_urlopen.call_count == 0
+
+    @patch("testcontainers.core.wait_strategies.urlopen")
+    def test_http_strategy_timeout_text_unchanged_while_running(self, mock_urlopen):
+        mock_urlopen.side_effect = URLError(ConnectionRefusedError())
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("running")]))
+        strategy = HttpWaitStrategy(8080).with_startup_timeout(1).with_poll_interval(0.01)
+
+        with pytest.raises(TimeoutError, match=r"HTTP endpoint not ready within 1.0 seconds"):
+            strategy.wait_until_ready(target)
+
+    @patch("socket.socket")
+    def test_port_strategy_fails_on_next_poll_when_container_exits(self, mock_socket):
+        mock_socket.return_value.__enter__.return_value.connect.side_effect = ConnectionRefusedError()
+        target = FakeWaitTarget(
+            FakeWrappedContainer(
+                [_container_state("running"), _container_state("running"), _container_state("exited", 137, True)]
+            )
+        )
+        strategy = PortWaitStrategy(9000).with_startup_timeout(30).with_poll_interval(0.01)
+
+        start = time.monotonic()
+        with pytest.raises(ContainerExitedException, match=r"exit code 137 \(OOM killed\)"):
+            strategy.wait_until_ready(target)
+        assert time.monotonic() - start < 5
+        assert mock_socket.return_value.__enter__.return_value.connect.call_count == 1
+
+    @patch("socket.socket")
+    def test_port_strategy_timeout_text_unchanged_while_running(self, mock_socket):
+        mock_socket.return_value.__enter__.return_value.connect.side_effect = ConnectionRefusedError()
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("running")]))
+        strategy = PortWaitStrategy(9000).with_startup_timeout(1).with_poll_interval(0.01)
+
+        with pytest.raises(TimeoutError, match=r"Port 9000 not available within 1.0 seconds"):
+            strategy.wait_until_ready(target)
+
+    def test_file_strategy_fails_on_next_poll_when_container_exits(self, monkeypatch):
+        monkeypatch.setattr("pathlib.Path.is_file", lambda self: False)
+        target = FakeWaitTarget(
+            FakeWrappedContainer(
+                [_container_state("running"), _container_state("running"), _container_state("exited", 0)]
+            )
+        )
+        strategy = FileExistsWaitStrategy("/tmp/marker").with_startup_timeout(30).with_poll_interval(0.01)
+
+        start = time.monotonic()
+        with pytest.raises(ContainerExitedException, match=r"exit code 0"):
+            strategy.wait_until_ready(target)
+        assert time.monotonic() - start < 5
+
+    def test_file_strategy_fails_immediately_when_container_already_exited(self, monkeypatch):
+        checked = Mock(return_value=False)
+        monkeypatch.setattr("pathlib.Path.is_file", checked)
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("exited", 0)]))
+        strategy = FileExistsWaitStrategy("/tmp/marker").with_startup_timeout(30).with_poll_interval(0.01)
+
+        with pytest.raises(ContainerExitedException, match=r"exit code 0"):
+            strategy.wait_until_ready(target)
+        assert checked.call_count == 0
+
+    def test_file_strategy_timeout_text_unchanged_while_running(self, monkeypatch, caplog):
+        monkeypatch.setattr("pathlib.Path.is_file", lambda self: False)
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("running")]))
+        strategy = FileExistsWaitStrategy("/tmp/marker").with_startup_timeout(1).with_poll_interval(0.01)
+
+        with pytest.raises(TimeoutError, match=r"File /tmp/marker did not exist within 1.000 seconds"):
+            with caplog.at_level(logging.CRITICAL, logger="testcontainers.core.wait_strategies"):
+                strategy.wait_until_ready(target)
+
+    def test_exec_strategy_fails_on_next_poll_when_container_exits(self):
+        target = FakeWaitTarget(
+            FakeWrappedContainer(
+                [_container_state("running"), _container_state("running"), _container_state("exited", 7)]
+            ),
+            exec_result=SimpleNamespace(exit_code=1, output=b"not ready"),
+        )
+        strategy = ExecWaitStrategy(["check-ready"]).with_startup_timeout(30).with_poll_interval(0.01)
+
+        start = time.monotonic()
+        with pytest.raises(ContainerExitedException, match=r"exit code 7"):
+            strategy.wait_until_ready(target)
+        assert time.monotonic() - start < 5
+        assert target.exec_calls == 1
+
+    def test_exec_strategy_fails_immediately_when_container_already_exited(self):
+        target = FakeWaitTarget(
+            FakeWrappedContainer([_container_state("exited", 2)]),
+            exec_result=SimpleNamespace(exit_code=0, output=b""),
+        )
+        strategy = ExecWaitStrategy(["check-ready"]).with_startup_timeout(30).with_poll_interval(0.01)
+
+        with pytest.raises(ContainerExitedException, match=r"exit code 2"):
+            strategy.wait_until_ready(target)
+        assert target.exec_calls == 0
+
+    def test_exec_strategy_timeout_text_unchanged_while_running(self):
+        target = FakeWaitTarget(
+            FakeWrappedContainer([_container_state("running")]),
+            exec_result=SimpleNamespace(exit_code=1, output=b"not ready"),
+        )
+        strategy = ExecWaitStrategy(["check-ready"]).with_startup_timeout(1).with_poll_interval(0.01)
+
+        with pytest.raises(TimeoutError, match=r"Command execution did not succeed within 1.000 seconds"):
+            strategy.wait_until_ready(target)
+
+
+class TestContainerStatusWaitStrategyExitHandling:
+    """Status strategy used while resolving exposed ports."""
+
+    def test_exited_container_fails_with_exit_code(self, monkeypatch: pytest.MonkeyPatch):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("exited", 1)]))
+        strategy = ContainerStatusWaitStrategy().with_startup_timeout(1).with_poll_interval(0.01)
+        monkeypatch.setattr(
+            strategy, "get_status", Mock(side_effect=AssertionError("status must not be read for an exited container"))
+        )
+
+        with pytest.raises(ContainerExitedException, match=r"exit code 1"):
+            strategy.wait_until_ready(target)
+
+    def test_dead_container_fails_with_exit_code(self, monkeypatch: pytest.MonkeyPatch):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("dead", 139)]))
+        strategy = ContainerStatusWaitStrategy().with_startup_timeout(1).with_poll_interval(0.01)
+        monkeypatch.setattr(
+            strategy, "get_status", Mock(side_effect=AssertionError("status must not be read for a dead container"))
+        )
+
+        with pytest.raises(ContainerExitedException, match=r"exit code 139"):
+            strategy.wait_until_ready(target)
+
+    def test_created_then_running_succeeds(self, monkeypatch: pytest.MonkeyPatch):
+        target = FakeWaitTarget(
+            FakeWrappedContainer(
+                [_container_state("created"), _container_state("created"), _container_state("running")]
+            )
+        )
+        strategy = ContainerStatusWaitStrategy().with_startup_timeout(1).with_poll_interval(0.01)
+        monkeypatch.setattr(
+            strategy, "get_status", lambda container: container.get_wrapped_container().attrs["State"]["Status"]
+        )
+
+        strategy.wait_until_ready(target)
+
+    def test_paused_is_not_an_exit_and_times_out_with_original_text(self, monkeypatch: pytest.MonkeyPatch):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("paused")]))
+        strategy = ContainerStatusWaitStrategy().with_startup_timeout(1).with_poll_interval(0.01)
+        monkeypatch.setattr(strategy, "get_status", lambda container: "paused")
+
+        with pytest.raises(TimeoutError, match=r"container did not become running"):
+            strategy.wait_until_ready(target)
+
+    def test_unreadable_status_is_not_an_exit(self, monkeypatch: pytest.MonkeyPatch):
+        target = FakeWaitTarget(FakeWrappedContainer([_container_state("running")]))
+        strategy = ContainerStatusWaitStrategy().with_startup_timeout(1).with_poll_interval(0.01)
+        monkeypatch.setattr(strategy, "get_status", Mock(side_effect=RuntimeError("docker daemon unavailable")))
+
+        with pytest.raises(TimeoutError, match=r"container did not become running"):
+            strategy.wait_until_ready(target)
+
+
+class TestComposeContainerReload:
+    """Compose snapshots must observe service exits during waiting (ps always reports fresh)."""
+
+    @staticmethod
+    def _make_compose_mock(
+        fresh: Optional[ComposeContainer], *, inspect_info: Optional[ContainerInspectInfo] = None
+    ) -> tuple[Mock, Mock]:
+        docker_compose = Mock()
+        docker_compose.get_container.return_value = fresh
+        docker_client = Mock()
+        docker_client.get_container_inspect_info.return_value = inspect_info
+        docker_compose._get_docker_client.return_value = docker_client
+        return docker_compose, docker_client
+
+    def test_reload_refreshes_exited_state_and_oom(self):
+        fresh = ComposeContainer(Service="svc", State="exited", ExitCode=137, ID="abc")
+        docker_compose, docker_client = self._make_compose_mock(
+            fresh, inspect_info=ContainerInspectInfo(State=ContainerState(OOMKilled=True))
+        )
+        snapshot = ComposeContainer(Service="svc", State="running", ID="abc")
+        snapshot._docker_compose = cast("Any", docker_compose)
+
+        snapshot.reload()
+
+        docker_compose.get_container.assert_called_once_with("svc", include_all=True)
+        assert snapshot.State == "exited"
+        assert snapshot.ExitCode == 137
+        assert snapshot.OOMKilled is True
+
+    def test_reload_keeps_last_snapshot_when_state_unreadable(self):
+        docker_compose, docker_client = self._make_compose_mock(None)
+        docker_compose.get_container.side_effect = RuntimeError("ps failed")
+        snapshot = ComposeContainer(Service="svc", State="running", ID="abc")
+        snapshot._docker_compose = cast("Any", docker_compose)
+
+        snapshot.reload()
+
+        assert snapshot.State == "running"
+        assert snapshot.ExitCode is None
+        docker_client.get_container_inspect_info.assert_not_called()
+
+    def test_reload_does_not_inspect_oom_for_running_service(self):
+        fresh = ComposeContainer(Service="svc", State="running", ID="abc")
+        docker_compose, docker_client = self._make_compose_mock(
+            fresh, inspect_info=ContainerInspectInfo(State=ContainerState(OOMKilled=True))
+        )
+        snapshot = ComposeContainer(Service="svc", State="running", ID="abc")
+        snapshot._docker_compose = cast("Any", docker_compose)
+
+        snapshot.reload()
+
+        assert snapshot.State == "running"
+        assert snapshot.OOMKilled is None
+        docker_client.get_container_inspect_info.assert_not_called()
+
+    def test_exit_detection_uses_refreshed_compose_snapshot(self):
+        fresh = ComposeContainer(Service="svc", State="exited", ExitCode=137, ID="abc")
+        docker_compose, docker_client = self._make_compose_mock(
+            fresh, inspect_info=ContainerInspectInfo(State=ContainerState(OOMKilled=True))
+        )
+        snapshot = ComposeContainer(Service="svc", State="running", ID="abc")
+        snapshot._docker_compose = cast("Any", docker_compose)
+
+        exit_state = get_container_exit_state(snapshot)
+
+        assert exit_state is not None
+        assert exit_state.exit_code == 137
+        assert exit_state.oom_killed is True

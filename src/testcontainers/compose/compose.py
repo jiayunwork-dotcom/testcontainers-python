@@ -17,7 +17,7 @@ from typing_extensions import Self
 from testcontainers.core.docker_client import DockerClient, get_docker_host_hostname, is_podman
 from testcontainers.core.exceptions import ContainerIsNotRunning, NoSuchPortExposed
 from testcontainers.core.inspect import ContainerInspectInfo, _ignore_properties
-from testcontainers.core.waiting_utils import WaitStrategy
+from testcontainers.core.waiting_utils import EXITED_CONTAINER_STATUSES, WaitStrategy
 
 _WARNINGS = {"DOCKER_COMPOSE_GET_CONFIG": "get_config is experimental, see testcontainers/testcontainers-python#669"}
 
@@ -96,6 +96,7 @@ class ComposeContainer:
     State: Optional[str] = None
     Health: Optional[str] = None
     ExitCode: Optional[int] = None
+    OOMKilled: Optional[bool] = None
     Publishers: list[PublishedPortModel] = field(default_factory=list)
     _docker_compose: Optional["DockerCompose"] = field(default=None, init=False, repr=False)
     _cached_container_info: Optional[ContainerInspectInfo] = field(default=None, init=False, repr=False)
@@ -160,10 +161,40 @@ class ComposeContainer:
         return self
 
     def reload(self) -> None:
-        """Reload container information for compatibility with wait strategies."""
-        # ComposeContainer doesn't need explicit reloading as it's fetched fresh
-        # each time through get_container(), but we need this method for compatibility
-        pass
+        """Refresh the service state from ``docker compose ps`` for wait strategies.
+
+        The snapshot returned by ``get_container`` never updates itself, so without
+        this reload a service that exits while a wait strategy is polling would keep
+        reporting its initial (running) state until the timeout.
+        """
+        if not self._docker_compose or not self.Service:
+            return
+
+        try:
+            fresh = self._docker_compose.get_container(self.Service, include_all=True)
+        except Exception as e:
+            # A state that cannot be read must not be mistaken for an exit: keep the
+            # last known snapshot and let the wait strategy continue polling.
+            logger.debug("could not refresh state of compose service %s: %s", self.Service, e)
+            return
+
+        self.ID = fresh.ID
+        self.Name = fresh.Name
+        self.State = fresh.State
+        self.Health = fresh.Health
+        self.ExitCode = fresh.ExitCode
+        self.Publishers = fresh.Publishers
+        self.OOMKilled = fresh.OOMKilled
+
+        # ``docker compose ps`` does not report OOM kills. Once the service has
+        # definitely exited, ask the daemon directly (bypassing the cached
+        # get_container_info(), whose caching behaviour must not change).
+        if self.State in EXITED_CONTAINER_STATUSES and self.ID:
+            try:
+                inspect_info = self._docker_compose._get_docker_client().get_container_inspect_info(self.ID)
+                self.OOMKilled = inspect_info.State.OOMKilled if inspect_info.State else None
+            except Exception as e:
+                logger.debug("could not inspect compose service %s for OOM state: %s", self.Service, e)
 
     def get_container_info(self) -> Optional[ContainerInspectInfo]:
         """Get container information via docker inspect (lazy loaded).
